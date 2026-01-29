@@ -21,7 +21,6 @@ import org.eclipse.jdt.annotation.NonNullByDefault;
  */
 @NonNullByDefault
 public class GeneracMobileLinkAccountConfiguration {
-    public String username = "";
-    public String password = "";
+    public String sessionCookie = "";
     public Integer refreshInterval = 60;
 }
