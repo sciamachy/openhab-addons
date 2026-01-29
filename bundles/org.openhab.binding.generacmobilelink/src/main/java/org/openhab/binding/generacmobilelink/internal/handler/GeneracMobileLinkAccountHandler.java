@@ -21,27 +21,18 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.api.ContentResponse;
 import org.eclipse.jetty.client.api.Request;
-import org.eclipse.jetty.client.util.FormContentProvider;
-import org.eclipse.jetty.util.Fields;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
 import org.openhab.binding.generacmobilelink.internal.GeneracMobileLinkBindingConstants;
 import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkAccountConfiguration;
 import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkGeneratorConfiguration;
 import org.openhab.binding.generacmobilelink.internal.discovery.GeneracMobileLinkDiscoveryService;
 import org.openhab.binding.generacmobilelink.internal.dto.Apparatus;
 import org.openhab.binding.generacmobilelink.internal.dto.ApparatusDetail;
-import org.openhab.binding.generacmobilelink.internal.dto.SelfAssertedResponse;
-import org.openhab.binding.generacmobilelink.internal.dto.SignInConfig;
 import org.openhab.core.io.net.http.HttpClientFactory;
 import org.openhab.core.thing.Bridge;
 import org.openhab.core.thing.ChannelUID;
@@ -62,7 +53,10 @@ import com.google.gson.JsonSyntaxException;
 
 /**
  * The {@link GeneracMobileLinkAccountHandler} is responsible for connecting to the MobileLink cloud service and
- * discovering generator things
+ * discovering generator things.
+ *
+ * Authentication is done via a session cookie that the user obtains by manually logging in via a web browser.
+ * This approach is necessary because Generac added CAPTCHA protection to their login flow.
  *
  * @author Dan Cunningham - Initial contribution
  */
@@ -72,8 +66,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private static final int REQUEST_TIMEOUT_MS = 10_000;
 
     private static final String API_BASE = "https://app.mobilelinkgen.com/api";
-    private static final String LOGIN_BASE = "https://generacconnectivity.b2clogin.com/generacconnectivity.onmicrosoft.com/B2C_1A_MobileLink_SignIn";
-    private static final Pattern SETTINGS_PATTERN = Pattern.compile("^var SETTINGS = (.*);$", Pattern.MULTILINE);
+    private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
     private static final Gson GSON = new GsonBuilder()
             .registerTypeAdapter(ZonedDateTime.class, (JsonDeserializer<ZonedDateTime>) (json, type,
                     jsonDeserializationContext) -> ZonedDateTime.parse(json.getAsJsonPrimitive().getAsString()))
@@ -82,7 +75,8 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private GeneracMobileLinkDiscoveryService discoveryService;
     private Map<String, Apparatus> apparatusesCache = new HashMap<>();
     private int refreshIntervalSeconds = 60;
-    private boolean loggedIn;
+    private boolean cookieConfigured;
+    private String sessionCookie = "";
 
     private @Nullable Future<?> pollFuture;
 
@@ -110,6 +104,8 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     @Override
     public void dispose() {
         stopOrRestartPoll(false);
+        cookieConfigured = false;
+        sessionCookie = "";
         try {
             httpClient.stop();
         } catch (Exception e) {
@@ -157,10 +153,9 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
 
     private void poll() {
         try {
-            if (!loggedIn) {
-                login();
+            if (!cookieConfigured) {
+                initializeCookie();
             }
-            loggedIn = true;
             updateGeneratorThings();
         } catch (IOException e) {
             logger.debug("Could not update devices", e);
@@ -170,15 +165,36 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             logger.debug("Session expired", e);
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
                     "@text/thing.generacmobilelink.account.offline.communication-error.session-expired");
-            loggedIn = false;
-        } catch (InvalidCredentialsException e) {
-            logger.debug("Credentials Invalid", e);
+            cookieConfigured = false;
+            // Stop polling since the user needs to manually refresh the cookie
+            stopOrRestartPoll(false);
+        } catch (MissingCookieException e) {
+            logger.debug("Cookie not configured", e);
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
-                    "@text/thing.generacmobilelink.account.offline.configuration-error.invalid-credentials");
-            loggedIn = false;
-            // we don't want to continue polling with bad credentials
+                    "@text/thing.generacmobilelink.account.offline.configuration-error.missing-cookie");
+            cookieConfigured = false;
+            // Stop polling since the configuration is invalid
             stopOrRestartPoll(false);
         }
+    }
+
+    /**
+     * Initializes the session cookie from configuration.
+     *
+     * @throws MissingCookieException if the session cookie is not configured or empty
+     */
+    private synchronized void initializeCookie() throws MissingCookieException {
+        logger.debug("Initializing session cookie from configuration");
+        GeneracMobileLinkAccountConfiguration config = getConfigAs(GeneracMobileLinkAccountConfiguration.class);
+        refreshIntervalSeconds = config.refreshInterval;
+
+        if (config.sessionCookie.isBlank()) {
+            throw new MissingCookieException("Session cookie is not configured");
+        }
+
+        sessionCookie = config.sessionCookie;
+        cookieConfigured = true;
+        logger.debug("Session cookie configured successfully");
     }
 
     private void updateGeneratorThings() throws IOException, SessionExpiredException {
@@ -225,10 +241,19 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
 
     private @Nullable <T> T getEndpoint(Class<T> clazz, String endpoint) throws IOException, SessionExpiredException {
         try {
-            ContentResponse response = httpClient.newRequest(API_BASE + endpoint).send();
+            Request request = httpClient.newRequest(API_BASE + endpoint)
+                    .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS).header("Cookie", sessionCookie)
+                    .header("User-Agent", USER_AGENT).header("Accept", "application/json, text/plain, */*")
+                    .header("Accept-Language", "en-US,en;q=0.9");
+
+            ContentResponse response = request.send();
             if (response.getStatus() == 204) {
                 // no data
                 return null;
+            }
+            if (response.getStatus() == 401 || response.getStatus() == 403) {
+                throw new SessionExpiredException(
+                        "Session cookie expired or invalid (HTTP " + response.getStatus() + ")");
             }
             if (response.getStatus() != 200) {
                 throw new SessionExpiredException("API returned status code: " + response.getStatus());
@@ -244,145 +269,10 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
         }
     }
 
-    /**
-     * Attempts to login through a Microsoft Azure implicit grant oauth flow
-     *
-     * @throws IOException if there is a problem communicating or parsing the responses
-     * @throws InvalidCredentialsException If Azure rejects the login credentials.
-     */
-    private synchronized void login() throws IOException, InvalidCredentialsException {
-        logger.debug("Attempting login");
-        GeneracMobileLinkAccountConfiguration config = getConfigAs(GeneracMobileLinkAccountConfiguration.class);
-        refreshIntervalSeconds = config.refreshInterval;
-        try {
-            ContentResponse signInResponse = httpClient.newRequest(API_BASE + "/Auth/SignIn?email=" + config.username)
-                    .send();
-
-            String responseData = signInResponse.getContentAsString();
-            logger.trace("response data: {}", responseData);
-
-            // If we are immediately returned a submit form, it means our cookies are still valid with the identity
-            // provider and we can just try and submit to the API service
-            if (submitPage(responseData)) {
-                return;
-            }
-
-            // Azure wants us to login again, look for the SETTINGS javascript in the page
-            Matcher matcher = SETTINGS_PATTERN.matcher(responseData);
-            if (!matcher.find()) {
-                throw new IOException("Could not find settings string");
-            }
-
-            String parseSettings = matcher.group(1);
-            logger.debug("parseSettings: {}", parseSettings);
-            SignInConfig signInConfig = GSON.fromJson(parseSettings, SignInConfig.class);
-
-            if (signInConfig == null) {
-                throw new IOException("Could not parse settings string");
-            }
-
-            Fields fields = new Fields();
-            fields.put("request_type", "RESPONSE");
-            fields.put("signInName", config.username);
-            fields.put("password", config.password);
-
-            Request selfAssertedRequest = httpClient.POST(LOGIN_BASE + "/SelfAsserted")
-                    .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS).header("X-Csrf-Token", signInConfig.csrf)
-                    .param("tx", "StateProperties=" + signInConfig.transId).param("p", "B2C_1A_SignUpOrSigninOnline")
-                    .content(new FormContentProvider(fields));
-
-            ContentResponse selfAssertedResponse = selfAssertedRequest.send();
-
-            logger.debug("selfAssertedRequest response {}", selfAssertedResponse.getStatus());
-
-            if (selfAssertedResponse.getStatus() != 200) {
-                throw new IOException("SelfAsserted: Bad response status: " + selfAssertedResponse.getStatus());
-            }
-
-            SelfAssertedResponse sa = GSON.fromJson(selfAssertedResponse.getContentAsString(),
-                    SelfAssertedResponse.class);
-
-            if (sa == null) {
-                throw new IOException("SelfAsserted Could not parse response JSON");
-            }
-
-            if (!"200".equals(sa.status)) {
-                throw new InvalidCredentialsException("Invalid Credentials: " + sa.message);
-            }
-
-            Request confirmedRequest = httpClient.newRequest(LOGIN_BASE + "/api/CombinedSigninAndSignup/confirmed")
-                    .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS).param("csrf_token", signInConfig.csrf)
-                    .param("tx", "StateProperties=" + signInConfig.transId).param("p", "B2C_1A_SignUpOrSigninOnline");
-
-            ContentResponse confirmedResponse = confirmedRequest.send();
-
-            if (confirmedResponse.getStatus() != 200) {
-                throw new IOException("CombinedSigninAndSignup bad response: " + confirmedResponse.getStatus());
-            }
-
-            String loginString = confirmedResponse.getContentAsString();
-            logger.trace("confirmedResponse: {}", loginString);
-            if (!submitPage(loginString)) {
-                throw new IOException("Error parsing HTML submit form");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException(e);
-        } catch (ExecutionException | TimeoutException | JsonSyntaxException e) {
-            throw new IOException(e);
-        }
-    }
-
-    /**
-     * Attempts to submit a HTML form from Azure to the Generac API, returns false if the HTML does not match the
-     * required form
-     *
-     * @param loginString
-     * @return false if the HTML is not a form, true if submission is successful
-     * @throws ExecutionException
-     * @throws TimeoutException
-     * @throws InterruptedException
-     * @throws JsonSyntaxException
-     * @throws IOException
-     */
-    private boolean submitPage(String loginString)
-            throws ExecutionException, TimeoutException, InterruptedException, JsonSyntaxException, IOException {
-        Document loginPage = Jsoup.parse(loginString);
-        Element form = loginPage.select("form").first();
-        Element loginState = loginPage.select("input[name=state]").first();
-        Element loginCode = loginPage.select("input[name=code]").first();
-
-        if (form == null || loginState == null || loginCode == null) {
-            logger.debug("Could not load login page");
-            return false;
-        }
-
-        // url that the form will submit to
-        String action = form.attr("action");
-
-        Fields fields = new Fields();
-        fields.put("state", loginState.attr("value"));
-        fields.put("code", loginCode.attr("value"));
-
-        Request loginRequest = httpClient.POST(action).timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                .content(new FormContentProvider(fields));
-
-        ContentResponse loginResponse = loginRequest.send();
-        if (logger.isTraceEnabled()) {
-            logger.trace("login response {} {}", loginResponse.getStatus(), loginResponse.getContentAsString());
-        } else {
-            logger.debug("login response status {}", loginResponse.getStatus());
-        }
-        if (loginResponse.getStatus() != 200) {
-            throw new IOException("Bad api login resposne: " + loginResponse.getStatus());
-        }
-        return true;
-    }
-
-    private class InvalidCredentialsException extends Exception {
+    private class MissingCookieException extends Exception {
         private static final long serialVersionUID = 1L;
 
-        public InvalidCredentialsException(String message) {
+        public MissingCookieException(String message) {
             super(message);
         }
     }
