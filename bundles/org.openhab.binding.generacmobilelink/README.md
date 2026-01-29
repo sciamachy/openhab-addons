@@ -24,11 +24,25 @@ The MobileLink account bridge must be added manually. Once added, generator thin
 
 ### MobileLink Account
 
-| Parameter       | Description                                                                        |
-|-----------------|------------------------------------------------------------------------------------|
-| username        | The user name, typically an email address, used to login to the MobileLink service |
-| password        | The password used to login to the MobileLink service                               |
-| refreshInterval | The frequency to poll for generator updates, minimum duration is 30 seconds        |
+| Parameter       | Description                                                                 |
+|-----------------|-----------------------------------------------------------------------------|
+| sessionCookie   | Session cookie obtained from browser after logging in to MobileLink portal  |
+| refreshInterval | The frequency to poll for generator updates, minimum duration is 30 seconds |
+
+### Obtaining the Session Cookie
+
+The MobileLink portal uses CAPTCHA protection on its login page, which prevents automated login.
+You must manually obtain a session cookie from your browser:
+
+1. Open your web browser and navigate to [app.mobilelinkgen.com](https://app.mobilelinkgen.com)
+2. Log in with your MobileLink credentials
+3. Open browser Developer Tools (F12 or right-click → Inspect)
+4. Go to the **Application** tab (Chrome/Edge) or **Storage** tab (Firefox)
+5. In the left sidebar, expand **Cookies** and select `https://app.mobilelinkgen.com`
+6. Find the cookie named `.AspNetCore.Cookies` and copy its **Value**
+7. Paste this value into the `sessionCookie` configuration parameter
+
+**Note:** Session cookies expire periodically. If the binding goes offline with a "session expired" error, you will need to repeat this process to obtain a fresh cookie.
 
 ## Channels
 
@@ -60,7 +74,7 @@ All channels are read-only.
 ### Things
 
 ```java
-Bridge generacmobilelink:account:main "MobileLink Account" [ userName="foo@bar.com", password="secret",refreshInterval=60 ] {
+Bridge generacmobilelink:account:main "MobileLink Account" [ sessionCookie="CfDJ8...<long cookie value>...", refreshInterval=60 ] {
     Thing generator 123456 "MobileLink Generator" [ generatorId="123456" ]
 }
 ```
@@ -84,7 +98,6 @@ Number:Time GeneratorRunHours "Number of Hours Run [%d]" { channel="generacmobil
 Number:ElectricPotential GeneratorBatteryVoltage "Battery Voltage [%d]v" { channel="generacmobilelink:generator:main:123456:batteryVoltage" }
 Number:Time GeneratorHoursOfProtection "Number of Hours of Protection [%d]" { channel="generacmobilelink:generator:main:123456:hoursOfProtection" }
 Number:Dimensionless GeneratorSignalStrength "Signal Strength [%d]" { channel="generacmobilelink:generator:main:123456:signalStrength" }
-
 ```
 
 ### Sitemap
