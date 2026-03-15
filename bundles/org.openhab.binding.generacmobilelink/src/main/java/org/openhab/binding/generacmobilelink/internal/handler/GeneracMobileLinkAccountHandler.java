@@ -35,8 +35,9 @@ import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkGe
 import org.openhab.binding.generacmobilelink.internal.discovery.GeneracMobileLinkDiscoveryService;
 import org.openhab.binding.generacmobilelink.internal.dto.Apparatus;
 import org.openhab.binding.generacmobilelink.internal.dto.ApparatusDetail;
-import org.openhab.core.config.core.Configuration;
 import org.openhab.core.io.net.http.HttpClientFactory;
+import org.openhab.core.storage.Storage;
+import org.openhab.core.storage.StorageService;
 import org.openhab.core.thing.Bridge;
 import org.openhab.core.thing.ChannelUID;
 import org.openhab.core.thing.Thing;
@@ -67,6 +68,7 @@ import com.google.gson.JsonSyntaxException;
 public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private final Logger logger = LoggerFactory.getLogger(GeneracMobileLinkAccountHandler.class);
     private static final int REQUEST_TIMEOUT_MS = 10_000;
+    private static final String STORAGE_KEY_SESSION_COOKIE = "sessionCookie";
 
     private static final String API_BASE = "https://app.mobilelinkgen.com/api";
     private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -76,6 +78,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             .create();
     private HttpClient httpClient;
     private GeneracMobileLinkDiscoveryService discoveryService;
+    private Storage<String> storage;
     private Map<String, Apparatus> apparatusesCache = new HashMap<>();
     private int refreshIntervalSeconds = 60;
     private boolean cookieConfigured;
@@ -84,9 +87,12 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private @Nullable Future<?> pollFuture;
 
     public GeneracMobileLinkAccountHandler(Bridge bridge, HttpClientFactory httpClientFactory,
-            GeneracMobileLinkDiscoveryService discoveryService) {
+            GeneracMobileLinkDiscoveryService discoveryService, StorageService storageService) {
         super(bridge);
         this.discoveryService = discoveryService;
+        // Create storage unique to this thing instance (so multiple accounts work)
+        this.storage = storageService.getStorage(
+                GeneracMobileLinkBindingConstants.BINDING_ID + "." + bridge.getUID().getAsString().replace(":", "_"));
         httpClient = httpClientFactory.createHttpClient(GeneracMobileLinkBindingConstants.BINDING_ID);
         httpClient.setFollowRedirects(true);
         // We have to send a very large amount of cookies which exceeds the default buffer size
@@ -182,22 +188,33 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     }
 
     /**
-     * Initializes the session cookie from configuration.
+     * Initializes the session cookie. First checks persistent storage for a previously
+     * saved cookie (from auto-renewal), then falls back to thing configuration.
      *
-     * @throws MissingCookieException if the session cookie is not configured or empty
+     * @throws MissingCookieException if no session cookie is available
      */
     private synchronized void initializeCookie() throws MissingCookieException {
-        logger.debug("Initializing session cookie from configuration");
+        logger.debug("Initializing session cookie");
         GeneracMobileLinkAccountConfiguration config = getConfigAs(GeneracMobileLinkAccountConfiguration.class);
         refreshIntervalSeconds = config.refreshInterval;
 
+        // First, check storage for a previously saved cookie (from auto-renewal)
+        String storedCookie = storage.get(STORAGE_KEY_SESSION_COOKIE);
+        if (storedCookie != null && !storedCookie.isBlank()) {
+            sessionCookie = storedCookie;
+            cookieConfigured = true;
+            logger.debug("Session cookie loaded from persistent storage");
+            return;
+        }
+
+        // Fall back to thing configuration (initial setup)
         if (config.sessionCookie.isBlank()) {
             throw new MissingCookieException("Session cookie is not configured");
         }
 
         sessionCookie = config.sessionCookie;
         cookieConfigured = true;
-        logger.debug("Session cookie configured successfully");
+        logger.debug("Session cookie loaded from thing configuration");
     }
 
     private void updateGeneratorThings() throws IOException, SessionExpiredException {
@@ -316,8 +333,8 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             sessionCookie = newCookieString;
             logger.debug("Session cookie updated with {} cookies", cookieMap.size());
 
-            // Persist to thing configuration so it survives restarts
-            persistCookieToConfig(newCookieString);
+            // Persist to storage so it survives restarts
+            persistCookie(newCookieString);
         }
     }
 
@@ -356,16 +373,15 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     }
 
     /**
-     * Persists the updated cookie to the thing configuration so it survives restarts.
+     * Persists the updated cookie to storage so it survives restarts.
+     * This is separate from the thing configuration file, which remains unchanged.
      */
-    private void persistCookieToConfig(String newCookieString) {
+    private void persistCookie(String newCookieString) {
         try {
-            Configuration config = editConfiguration();
-            config.put("sessionCookie", newCookieString);
-            updateConfiguration(config);
-            logger.debug("Persisted updated session cookie to thing configuration");
+            storage.put(STORAGE_KEY_SESSION_COOKIE, newCookieString);
+            logger.debug("Persisted updated session cookie to storage");
         } catch (Exception e) {
-            logger.debug("Could not persist cookie to configuration: {}", e.getMessage());
+            logger.debug("Could not persist cookie to storage: {}", e.getMessage());
         }
     }
 
