@@ -203,7 +203,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
         if (storedCookie != null && !storedCookie.isBlank()) {
             sessionCookie = storedCookie;
             cookieConfigured = true;
-            logger.debug("Session cookie loaded from persistent storage");
+            logger.info("Session cookie loaded from persistent storage");
             return;
         }
 
@@ -214,7 +214,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
 
         sessionCookie = config.sessionCookie;
         cookieConfigured = true;
-        logger.debug("Session cookie loaded from thing configuration");
+        logger.info("Session cookie loaded from thing configuration");
     }
 
     private void updateGeneratorThings() throws IOException, SessionExpiredException {
@@ -303,7 +303,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             return;
         }
 
-        logger.debug("Received {} Set-Cookie header(s) from server", setCookieHeaders.size());
+        logger.info("Received {} Set-Cookie header(s) from server", setCookieHeaders.size());
 
         // Parse current cookies into a map
         Map<String, String> cookieMap = parseCookieString(sessionCookie);
@@ -319,7 +319,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
                     String value = nameValue[1].trim();
                     String oldValue = cookieMap.get(name);
                     if (oldValue == null || !oldValue.equals(value)) {
-                        logger.debug("Updating cookie: {}", name);
+                        logger.info("Updating cookie: {}", name);
                         cookieMap.put(name, value);
                         updated = true;
                     }
@@ -331,10 +331,13 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             // Rebuild cookie string
             String newCookieString = buildCookieString(cookieMap);
             sessionCookie = newCookieString;
-            logger.debug("Session cookie updated with {} cookies", cookieMap.size());
+            logger.info("Session cookie updated with {} cookies from server response", cookieMap.size());
 
             // Persist to storage so it survives restarts
             persistCookie(newCookieString);
+
+            // Fire trigger channel so rules can react
+            triggerChannel(GeneracMobileLinkBindingConstants.CHANNEL_COOKIE_UPDATED);
         }
     }
 
@@ -379,7 +382,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private void persistCookie(String newCookieString) {
         try {
             storage.put(STORAGE_KEY_SESSION_COOKIE, newCookieString);
-            logger.debug("Persisted updated session cookie to storage");
+            logger.info("Persisted updated session cookie to storage");
         } catch (Exception e) {
             logger.debug("Could not persist cookie to storage: {}", e.getMessage());
         }
