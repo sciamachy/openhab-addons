@@ -87,7 +87,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
         httpClient = httpClientFactory.createHttpClient(GeneracMobileLinkBindingConstants.BINDING_ID);
         httpClient.setFollowRedirects(true);
         // We have to send a very large amount of cookies which exceeds the default buffer size
-        httpClient.setRequestBufferSize(16348);
+        httpClient.setRequestBufferSize(32768);
         try {
             httpClient.start();
         } catch (Exception e) {
