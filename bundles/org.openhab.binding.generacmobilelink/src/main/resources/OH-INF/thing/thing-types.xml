@@ -8,6 +8,9 @@
 		<label>MobileLink Account</label>
 		<description>MobileLink Cloud Account</description>
 		<semantic-equipment-tag>WebService</semantic-equipment-tag>
+		<channels>
+			<channel id="cookieUpdated" typeId="cookieUpdated"/>
+		</channels>
 		<config-description-ref uri="thing-type:generacmobilelink:account"/>
 	</bridge-type>
 
@@ -165,5 +168,10 @@
 			<tag>SignalStrength</tag>
 		</tags>
 		<state readOnly="true" pattern="%d %unit%"/>
+	</channel-type>
+	<channel-type id="cookieUpdated">
+		<kind>trigger</kind>
+		<label>Cookie Updated</label>
+		<description>Fires when the session cookie is auto-renewed from a server response.</description>
 	</channel-type>
 </thing:thing-descriptions>

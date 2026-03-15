@@ -45,4 +45,7 @@ public class GeneracMobileLinkBindingConstants {
     public static final String CHANNEL_BATTERY_VOLTAGE = "batteryVoltage";
     public static final String CHANNEL_HOURS_OF_PROTECTION = "hoursOfProtection";
     public static final String CHANNEL_SIGNAL_STRENGH = "signalStrength";
+
+    // Bridge (account) channels
+    public static final String CHANNEL_COOKIE_UPDATED = "cookieUpdated";
 }

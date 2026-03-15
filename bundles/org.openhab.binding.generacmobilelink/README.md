@@ -39,12 +39,23 @@ You must manually obtain a session cookie from your browser:
 3. Open browser Developer Tools (F12 or right-click → Inspect)
 4. Go to the **Application** tab (Chrome/Edge) or **Storage** tab (Firefox)
 5. In the left sidebar, expand **Cookies** and select `https://app.mobilelinkgen.com`
-6. Find the cookie named `.AspNetCore.Cookies` and copy its **Value**
-7. Paste this value into the `sessionCookie` configuration parameter
+6. Copy **all** cookie name=value pairs (not just `.AspNetCore.Cookies`) and paste them into the `sessionCookie` parameter as a single semicolon-separated string
 
-**Note:** Session cookies expire periodically. If the binding goes offline with a "session expired" error, you will need to repeat this process to obtain a fresh cookie.
+### Cookie Auto-Renewal
+
+The binding automatically captures `Set-Cookie` headers from API responses and merges them into the active session cookie, mimicking how a browser maintains a session.
+Updated cookies are persisted to OpenHAB's storage service so they survive restarts.
+
+This means the initial cookie you provide should stay valid indefinitely as long as the server keeps renewing it.
+If the session does expire (HTTP 401/403), the binding will go OFFLINE with a "session expired" message and you will need to repeat the manual cookie extraction.
 
 ## Channels
+
+### Account Channels
+
+| Channel ID     | Type    | Description                                                        |
+|----------------|---------|--------------------------------------------------------------------|
+| cookieUpdated  | Trigger | Fires when the session cookie is auto-renewed from a server response |
 
 ### Generator Channels
 
@@ -98,6 +109,20 @@ Number:Time GeneratorRunHours "Number of Hours Run [%d]" { channel="generacmobil
 Number:ElectricPotential GeneratorBatteryVoltage "Battery Voltage [%d]v" { channel="generacmobilelink:generator:main:123456:batteryVoltage" }
 Number:Time GeneratorHoursOfProtection "Number of Hours of Protection [%d]" { channel="generacmobilelink:generator:main:123456:hoursOfProtection" }
 Number:Dimensionless GeneratorSignalStrength "Signal Strength [%d]" { channel="generacmobilelink:generator:main:123456:signalStrength" }
+```
+
+### Rules (JS Automation)
+
+React to cookie auto-renewal events:
+
+```javascript
+rules
+  .when()
+    .channel('generacmobilelink:account:main:cookieUpdated').triggered()
+  .then(e => {
+    console.info('Generac session cookie was auto-renewed');
+  })
+  .build('Generac Cookie Renewed');
 ```
 
 ### Sitemap
