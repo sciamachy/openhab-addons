@@ -15,6 +15,8 @@ package org.openhab.binding.generacmobilelink.internal.handler;
 import java.io.IOException;
 import java.time.ZonedDateTime;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
@@ -33,6 +35,7 @@ import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkGe
 import org.openhab.binding.generacmobilelink.internal.discovery.GeneracMobileLinkDiscoveryService;
 import org.openhab.binding.generacmobilelink.internal.dto.Apparatus;
 import org.openhab.binding.generacmobilelink.internal.dto.ApparatusDetail;
+import org.openhab.core.config.core.Configuration;
 import org.openhab.core.io.net.http.HttpClientFactory;
 import org.openhab.core.thing.Bridge;
 import org.openhab.core.thing.ChannelUID;
@@ -247,6 +250,10 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
                     .header("Accept-Language", "en-US,en;q=0.9");
 
             ContentResponse response = request.send();
+
+            // Capture any Set-Cookie headers to keep session alive
+            captureResponseCookies(response);
+
             if (response.getStatus() == 204) {
                 // no data
                 return null;
@@ -266,6 +273,99 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             throw new IOException(e);
         } catch (TimeoutException | ExecutionException | JsonSyntaxException e) {
             throw new IOException(e);
+        }
+    }
+
+    /**
+     * Captures Set-Cookie headers from an API response and merges them into the session cookie.
+     * This mimics browser behavior where cookies are automatically updated on each response.
+     */
+    private void captureResponseCookies(ContentResponse response) {
+        List<String> setCookieHeaders = response.getHeaders().getValuesList("Set-Cookie");
+        if (setCookieHeaders.isEmpty()) {
+            return;
+        }
+
+        logger.debug("Received {} Set-Cookie header(s) from server", setCookieHeaders.size());
+
+        // Parse current cookies into a map
+        Map<String, String> cookieMap = parseCookieString(sessionCookie);
+
+        // Parse and merge each Set-Cookie header
+        boolean updated = false;
+        for (String setCookie : setCookieHeaders) {
+            String[] parts = setCookie.split(";", 2);
+            if (parts.length > 0 && parts[0].contains("=")) {
+                String[] nameValue = parts[0].split("=", 2);
+                if (nameValue.length == 2) {
+                    String name = nameValue[0].trim();
+                    String value = nameValue[1].trim();
+                    String oldValue = cookieMap.get(name);
+                    if (oldValue == null || !oldValue.equals(value)) {
+                        logger.debug("Updating cookie: {}", name);
+                        cookieMap.put(name, value);
+                        updated = true;
+                    }
+                }
+            }
+        }
+
+        if (updated) {
+            // Rebuild cookie string
+            String newCookieString = buildCookieString(cookieMap);
+            sessionCookie = newCookieString;
+            logger.debug("Session cookie updated with {} cookies", cookieMap.size());
+
+            // Persist to thing configuration so it survives restarts
+            persistCookieToConfig(newCookieString);
+        }
+    }
+
+    /**
+     * Parses a cookie header string (name1=value1; name2=value2) into a map.
+     */
+    private Map<String, String> parseCookieString(String cookieString) {
+        Map<String, String> cookies = new LinkedHashMap<>();
+        if (cookieString.isBlank()) {
+            return cookies;
+        }
+        for (String part : cookieString.split(";")) {
+            String trimmed = part.trim();
+            int eqIdx = trimmed.indexOf('=');
+            if (eqIdx > 0) {
+                String name = trimmed.substring(0, eqIdx).trim();
+                String value = trimmed.substring(eqIdx + 1).trim();
+                cookies.put(name, value);
+            }
+        }
+        return cookies;
+    }
+
+    /**
+     * Builds a cookie header string from a map of cookies.
+     */
+    private String buildCookieString(Map<String, String> cookies) {
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> entry : cookies.entrySet()) {
+            if (sb.length() > 0) {
+                sb.append("; ");
+            }
+            sb.append(entry.getKey()).append("=").append(entry.getValue());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Persists the updated cookie to the thing configuration so it survives restarts.
+     */
+    private void persistCookieToConfig(String newCookieString) {
+        try {
+            Configuration config = editConfiguration();
+            config.put("sessionCookie", newCookieString);
+            updateConfiguration(config);
+            logger.debug("Persisted updated session cookie to thing configuration");
+        } catch (Exception e) {
+            logger.debug("Could not persist cookie to configuration: {}", e.getMessage());
         }
     }
 
