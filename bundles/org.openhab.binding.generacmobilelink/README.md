@@ -29,6 +29,12 @@ The MobileLink account bridge must be added manually. Once added, generator thin
 | sessionCookie   | Session cookie obtained from browser after logging in to MobileLink portal  |
 | refreshInterval | The frequency to poll for generator updates, minimum duration is 30 seconds |
 
+### Generator
+
+| Parameter   | Description                                                              |
+|-------------|--------------------------------------------------------------------------|
+| generatorId | The apparatus ID of the generator (automatically set during discovery)   |
+
 ### Obtaining the Session Cookie
 
 The MobileLink portal uses CAPTCHA protection on its login page, which prevents automated login.
