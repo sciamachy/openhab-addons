@@ -172,6 +172,9 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
                     "@text/thing.generacmobilelink.account.offline.communication-error.io-exception");
         } catch (SessionExpiredException e) {
             logger.debug("Session expired", e);
+            // Clear the stored cookie so the binding falls back to thing config on next init
+            storage.remove(STORAGE_KEY_SESSION_COOKIE);
+            logger.info("Cleared stored session cookie - update thing config with a fresh cookie");
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
                     "@text/thing.generacmobilelink.account.offline.communication-error.session-expired");
             cookieConfigured = false;
@@ -264,23 +267,23 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             Request request = httpClient.newRequest(API_BASE + endpoint)
                     .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS).header("Cookie", sessionCookie)
                     .header("User-Agent", USER_AGENT).header("Accept", "application/json, text/plain, */*")
-                    .header("Accept-Language", "en-US,en;q=0.9");
+                    .header("Accept-Language", "en-US,en;q=0.9").followRedirects(false);
 
             ContentResponse response = request.send();
 
             // Capture any Set-Cookie headers to keep session alive
             captureResponseCookies(response);
 
-            if (response.getStatus() == 204) {
+            int status = response.getStatus();
+            if (status == 204) {
                 // no data
                 return null;
             }
-            if (response.getStatus() == 401 || response.getStatus() == 403) {
-                throw new SessionExpiredException(
-                        "Session cookie expired or invalid (HTTP " + response.getStatus() + ")");
+            if (status == 401 || status == 403 || (status >= 300 && status < 400)) {
+                throw new SessionExpiredException("Session cookie expired or invalid (HTTP " + status + ")");
             }
-            if (response.getStatus() != 200) {
-                throw new SessionExpiredException("API returned status code: " + response.getStatus());
+            if (status != 200) {
+                throw new SessionExpiredException("API returned status code: " + status);
             }
             String data = response.getContentAsString();
             logger.debug("getEndpoint {}", data);
