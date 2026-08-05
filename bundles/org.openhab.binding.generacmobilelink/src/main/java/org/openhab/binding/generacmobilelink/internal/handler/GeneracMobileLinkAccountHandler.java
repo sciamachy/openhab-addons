@@ -76,7 +76,8 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             .registerTypeAdapter(ZonedDateTime.class, (JsonDeserializer<ZonedDateTime>) (json, type,
                     jsonDeserializationContext) -> ZonedDateTime.parse(json.getAsJsonPrimitive().getAsString()))
             .create();
-    private HttpClient httpClient;
+    private final HttpClientFactory httpClientFactory;
+    private volatile HttpClient httpClient;
     private GeneracMobileLinkDiscoveryService discoveryService;
     private Storage<String> storage;
     private Map<String, Apparatus> apparatusesCache = new HashMap<>();
@@ -93,20 +94,45 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
         // Create storage unique to this thing instance (so multiple accounts work)
         this.storage = storageService.getStorage(
                 GeneracMobileLinkBindingConstants.BINDING_ID + "." + bridge.getUID().getAsString().replace(":", "_"));
-        httpClient = httpClientFactory.createHttpClient(GeneracMobileLinkBindingConstants.BINDING_ID);
-        httpClient.setFollowRedirects(true);
+        this.httpClientFactory = httpClientFactory;
+        httpClient = createHttpClient();
+    }
+
+    /**
+     * Creates, configures and starts a new HTTP client. All client level settings live here so that a client
+     * created outside of the constructor is configured identically.
+     *
+     * @throws IllegalStateException if the client could not be started
+     */
+    private HttpClient createHttpClient() {
+        HttpClient client = httpClientFactory.createHttpClient(GeneracMobileLinkBindingConstants.BINDING_ID);
+        client.setFollowRedirects(true);
         // We have to send a very large amount of cookies which exceeds the default buffer size
-        httpClient.setRequestBufferSize(32768);
+        client.setRequestBufferSize(32768);
         try {
-            httpClient.start();
+            client.start();
         } catch (Exception e) {
             throw new IllegalStateException("Error starting custom HttpClient", e);
         }
+        return client;
     }
 
     @Override
     public void initialize() {
         updateStatus(ThingStatus.UNKNOWN);
+        // dispose() stops the HTTP client, but openHAB reuses the same handler instance when a DSL model is
+        // reloaded, which is exactly what happens when the thing file is edited to enter a fresh session
+        // cookie. Without this the handler would come back with a stopped client and every request would fail.
+        if (!httpClient.isRunning()) {
+            try {
+                httpClient = createHttpClient();
+            } catch (IllegalStateException e) {
+                logger.warn("Could not start HTTP client", e);
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
+                        "@text/thing.generacmobilelink.account.offline.configuration-error.http-client");
+                return;
+            }
+        }
         stopOrRestartPoll(true);
     }
 
