@@ -69,6 +69,12 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private final Logger logger = LoggerFactory.getLogger(GeneracMobileLinkAccountHandler.class);
     private static final int REQUEST_TIMEOUT_MS = 10_000;
     private static final String STORAGE_KEY_SESSION_COOKIE = "sessionCookie";
+    /**
+     * How many polls in a row have to fail before the bridge is taken offline. The MobileLink cloud sits behind a
+     * WAF that intermittently throttles or resets requests, so a single failed poll is the normal condition rather
+     * than an outage and almost always heals on the next one.
+     */
+    private static final int MAX_CONSECUTIVE_POLL_FAILURES = 3;
 
     private static final String API_BASE = "https://app.mobilelinkgen.com/api";
     private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -84,6 +90,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private int refreshIntervalSeconds = 60;
     private boolean cookieConfigured;
     private String sessionCookie = "";
+    private int consecutivePollFailures;
 
     private @Nullable Future<?> pollFuture;
 
@@ -120,6 +127,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     @Override
     public void initialize() {
         updateStatus(ThingStatus.UNKNOWN);
+        consecutivePollFailures = 0;
         // dispose() stops the HTTP client, but openHAB reuses the same handler instance when a DSL model is
         // reloaded, which is exactly what happens when the thing file is edited to enter a fresh session
         // cookie. Without this the handler would come back with a stopped client and every request would fail.
@@ -192,10 +200,9 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
                 initializeCookie();
             }
             updateGeneratorThings();
+            consecutivePollFailures = 0;
         } catch (IOException e) {
-            logger.debug("Could not update devices", e);
-            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
-                    "@text/thing.generacmobilelink.account.offline.communication-error.io-exception");
+            handleTransientPollFailure(e);
         } catch (SessionExpiredException e) {
             logger.debug("Session expired", e);
             // Clear the stored cookie so the binding falls back to thing config on next init
@@ -214,6 +221,26 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             // Stop polling since the configuration is invalid
             stopOrRestartPoll(false);
         }
+    }
+
+    /**
+     * Handles a communication failure that may well be transient. The bridge is only taken offline once
+     * {@link #MAX_CONSECUTIVE_POLL_FAILURES} polls in a row have failed, because going offline on the first one
+     * drags every child generator thing to BRIDGE_OFFLINE for a single missed poll and makes the bridge status
+     * useless as a health signal. Deterministic failures (expired cookie, missing cookie) are not routed here and
+     * still go offline immediately.
+     */
+    private void handleTransientPollFailure(Exception e) {
+        consecutivePollFailures++;
+        if (consecutivePollFailures < MAX_CONSECUTIVE_POLL_FAILURES) {
+            logger.warn("Poll failed ({} of {} tolerated before going offline): {}", consecutivePollFailures,
+                    MAX_CONSECUTIVE_POLL_FAILURES, e.getMessage());
+            logger.debug("Poll failure details", e);
+            return;
+        }
+        logger.debug("Could not update devices", e);
+        updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                "@text/thing.generacmobilelink.account.offline.communication-error.io-exception");
     }
 
     /**
@@ -309,7 +336,10 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
                 throw new SessionExpiredException("Session cookie expired or invalid (HTTP " + status + ")");
             }
             if (status != 200) {
-                throw new SessionExpiredException("API returned status code: " + status);
+                // Anything else (429 throttling, 5xx, WAF error pages) says nothing about the session, so treat it
+                // as a communication failure. Routing it through SessionExpiredException would wipe the stored
+                // cookie and stop the poll loop over a blip that heals on its own.
+                throw new IOException("API returned status code: " + status);
             }
             String data = response.getContentAsString();
             logger.debug("getEndpoint {}", data);
