@@ -145,7 +145,7 @@ public class HeosSystem {
         eventSendCommand.disconnect();
         sendCommand.disconnect();
         ExecutorService executor = this.singleThreadExecutor;
-        if (executor != null && executor.isShutdown()) {
+        if (executor != null && !executor.isShutdown()) {
             executor.shutdownNow();
         }
     }
