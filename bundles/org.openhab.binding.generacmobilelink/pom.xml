@@ -14,12 +14,4 @@
 
   <name>openHAB Add-ons :: Bundles :: GeneracMobileLink Binding</name>
 
-  <dependencies>
-    <dependency>
-      <groupId>org.jsoup</groupId>
-      <artifactId>jsoup</artifactId>
-      <version>${jsoup.version}</version>
-      <scope>provided</scope>
-    </dependency>
-  </dependencies>
 </project>

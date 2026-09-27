@@ -26,6 +26,7 @@ import org.openhab.binding.generacmobilelink.internal.handler.GeneracMobileLinkA
 import org.openhab.binding.generacmobilelink.internal.handler.GeneracMobileLinkGeneratorHandler;
 import org.openhab.core.config.discovery.DiscoveryService;
 import org.openhab.core.io.net.http.HttpClientFactory;
+import org.openhab.core.storage.StorageService;
 import org.openhab.core.thing.Bridge;
 import org.openhab.core.thing.Thing;
 import org.openhab.core.thing.ThingTypeUID;
@@ -51,10 +52,13 @@ public class GeneracMobileLinkHandlerFactory extends BaseThingHandlerFactory {
             THING_TYPE_GENERATOR);
     private final Map<ThingUID, ServiceRegistration<?>> discoveryServiceRegs = new ConcurrentHashMap<>();
     private final HttpClientFactory httpClientFactory;
+    private final StorageService storageService;
 
     @Activate
-    public GeneracMobileLinkHandlerFactory(final @Reference HttpClientFactory httpClientFactory) {
+    public GeneracMobileLinkHandlerFactory(final @Reference HttpClientFactory httpClientFactory,
+            final @Reference StorageService storageService) {
         this.httpClientFactory = httpClientFactory;
+        this.storageService = storageService;
     }
 
     @Override
@@ -73,7 +77,7 @@ public class GeneracMobileLinkHandlerFactory extends BaseThingHandlerFactory {
         if (THING_TYPE_ACCOUNT.equals(thingTypeUID)) {
             GeneracMobileLinkDiscoveryService discoveryService = new GeneracMobileLinkDiscoveryService();
             GeneracMobileLinkAccountHandler accountHandler = new GeneracMobileLinkAccountHandler((Bridge) thing,
-                    httpClientFactory, discoveryService);
+                    httpClientFactory, discoveryService, storageService);
             discoveryServiceRegs.put(accountHandler.getThing().getUID(), bundleContext
                     .registerService(DiscoveryService.class.getName(), discoveryService, new Hashtable<>()));
             return accountHandler;

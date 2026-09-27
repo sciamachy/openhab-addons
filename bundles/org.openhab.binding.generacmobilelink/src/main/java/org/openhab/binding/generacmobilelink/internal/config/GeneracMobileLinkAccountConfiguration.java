@@ -18,10 +18,12 @@ import org.eclipse.jdt.annotation.NonNullByDefault;
  * The {@link GeneracMobileLinkAccountConfiguration} class contains fields mapping thing configuration parameters.
  *
  * @author Dan Cunningham - Initial contribution
+ * @author Chris Harris - One-time code for Auth0 login
  */
 @NonNullByDefault
 public class GeneracMobileLinkAccountConfiguration {
     public String username = "";
     public String password = "";
-    public Integer refreshInterval = 60;
+    public String mfaCode = "";
+    public Integer refreshInterval = 300;
 }
