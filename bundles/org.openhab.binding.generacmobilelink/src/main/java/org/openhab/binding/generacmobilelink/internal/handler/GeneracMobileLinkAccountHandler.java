@@ -14,35 +14,30 @@ package org.openhab.binding.generacmobilelink.internal.handler;
 
 import java.io.IOException;
 import java.time.ZonedDateTime;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.api.ContentResponse;
-import org.eclipse.jetty.client.api.Request;
-import org.eclipse.jetty.client.util.FormContentProvider;
-import org.eclipse.jetty.util.Fields;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.util.HttpCookieStore;
 import org.openhab.binding.generacmobilelink.internal.GeneracMobileLinkBindingConstants;
+import org.openhab.binding.generacmobilelink.internal.api.Auth0Client;
+import org.openhab.binding.generacmobilelink.internal.api.AuthException;
 import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkAccountConfiguration;
 import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkGeneratorConfiguration;
 import org.openhab.binding.generacmobilelink.internal.discovery.GeneracMobileLinkDiscoveryService;
 import org.openhab.binding.generacmobilelink.internal.dto.Apparatus;
 import org.openhab.binding.generacmobilelink.internal.dto.ApparatusDetail;
-import org.openhab.binding.generacmobilelink.internal.dto.SelfAssertedResponse;
-import org.openhab.binding.generacmobilelink.internal.dto.SignInConfig;
 import org.openhab.core.io.net.http.HttpClientFactory;
+import org.openhab.core.storage.StorageService;
 import org.openhab.core.thing.Bridge;
 import org.openhab.core.thing.ChannelUID;
 import org.openhab.core.thing.Thing;
@@ -51,7 +46,6 @@ import org.openhab.core.thing.ThingStatusDetail;
 import org.openhab.core.thing.binding.BaseBridgeHandler;
 import org.openhab.core.thing.binding.ThingHandler;
 import org.openhab.core.types.Command;
-import org.openhab.core.types.RefreshType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -65,67 +59,102 @@ import com.google.gson.JsonSyntaxException;
  * discovering generator things
  *
  * @author Dan Cunningham - Initial contribution
+ * @author Chris Harris - Auth0 login
  */
 @NonNullByDefault
 public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private final Logger logger = LoggerFactory.getLogger(GeneracMobileLinkAccountHandler.class);
     private static final int REQUEST_TIMEOUT_MS = 10_000;
+    /**
+     * How many polls in a row have to fail before the bridge goes offline. A single failed poll usually heals on the
+     * next one, and going offline drags every generator to BRIDGE_OFFLINE with it.
+     */
+    private static final int MAX_CONSECUTIVE_POLL_FAILURES = 3;
 
     private static final String API_BASE = "https://app.mobilelinkgen.com/api";
-    private static final String LOGIN_BASE = "https://generacconnectivity.b2clogin.com/generacconnectivity.onmicrosoft.com/B2C_1A_MobileLink_SignIn";
-    private static final Pattern SETTINGS_PATTERN = Pattern.compile("^var SETTINGS = (.*);$", Pattern.MULTILINE);
     private static final Gson GSON = new GsonBuilder()
             .registerTypeAdapter(ZonedDateTime.class, (JsonDeserializer<ZonedDateTime>) (json, type,
                     jsonDeserializationContext) -> ZonedDateTime.parse(json.getAsJsonPrimitive().getAsString()))
             .create();
-    private HttpClient httpClient;
-    private GeneracMobileLinkDiscoveryService discoveryService;
-    private Map<String, Apparatus> apparatusesCache = new HashMap<>();
-    private int refreshIntervalSeconds = 60;
-    private boolean loggedIn;
+    private final HttpClientFactory httpClientFactory;
+    private final GeneracMobileLinkDiscoveryService discoveryService;
+    private final AuthSession authSession;
+    private final Map<String, Apparatus> apparatusesCache = new ConcurrentHashMap<>();
+    private volatile @Nullable HttpClient httpClient;
+    private volatile @Nullable Auth0Client auth0Client;
+    private int consecutivePollFailures;
 
     private @Nullable Future<?> pollFuture;
+    /**
+     * Counts poll schedules, so that a poll that is still running after dispose() or a restart can tell it is stale
+     * and does not overwrite the status or cancel the new schedule.
+     */
+    private volatile int pollGeneration;
 
     public GeneracMobileLinkAccountHandler(Bridge bridge, HttpClientFactory httpClientFactory,
-            GeneracMobileLinkDiscoveryService discoveryService) {
+            GeneracMobileLinkDiscoveryService discoveryService, StorageService storageService) {
         super(bridge);
+        this.httpClientFactory = httpClientFactory;
         this.discoveryService = discoveryService;
-        httpClient = httpClientFactory.createHttpClient(GeneracMobileLinkBindingConstants.BINDING_ID);
-        httpClient.setFollowRedirects(true);
-        // We have to send a very large amount of cookies which exceeds the default buffer size
-        httpClient.setRequestBufferSize(16348);
-        try {
-            httpClient.start();
-        } catch (Exception e) {
-            throw new IllegalStateException("Error starting custom HttpClient", e);
-        }
+        this.authSession = new AuthSession(storageService.getStorage(
+                GeneracMobileLinkBindingConstants.BINDING_ID + "." + bridge.getUID().getAsString().replace(':', '_'),
+                String.class.getClassLoader()));
     }
 
     @Override
     public void initialize() {
+        GeneracMobileLinkAccountConfiguration config = getConfigAs(GeneracMobileLinkAccountConfiguration.class);
+        if (config.username.isBlank() || config.password.isBlank()) {
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
+                    "@text/thing.generacmobilelink.account.offline.configuration-error.missing-credentials");
+            return;
+        }
+        // Created here rather than in the constructor: openHAB reuses the handler instance when the thing is
+        // updated, calling dispose() and initialize() on it, and dispose() stops the client.
+        HttpClient client = httpClientFactory.createHttpClient(GeneracMobileLinkBindingConstants.BINDING_ID);
+        client.setFollowRedirects(false);
+        // Auth0Client keeps a cookie jar per login; the API needs no cookies at all
+        client.setCookieStore(new HttpCookieStore.Empty());
+        try {
+            client.start();
+        } catch (Exception e) {
+            logger.debug("Could not start HTTP client", e);
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                    "@text/thing.generacmobilelink.account.offline.communication-error.http-client");
+            return;
+        }
+        httpClient = client;
+        auth0Client = new Auth0Client(client);
+        consecutivePollFailures = 0;
+        authSession.configurationApplied();
         updateStatus(ThingStatus.UNKNOWN);
-        stopOrRestartPoll(true);
+        startPoll(config.refreshInterval);
     }
 
     @Override
     public void dispose() {
-        stopOrRestartPoll(false);
-        try {
-            httpClient.stop();
-        } catch (Exception e) {
-            logger.debug("Could not stop HttpClient", e);
+        stopPoll(true);
+        auth0Client = null;
+        HttpClient client = httpClient;
+        httpClient = null;
+        if (client != null) {
+            try {
+                client.stop();
+            } catch (Exception e) {
+                logger.debug("Could not stop HttpClient", e);
+            }
         }
     }
 
     @Override
+    public void handleRemoval() {
+        authSession.reset();
+        super.handleRemoval();
+    }
+
+    @Override
     public void handleCommand(ChannelUID channelUID, Command command) {
-        if (command instanceof RefreshType) {
-            try {
-                updateGeneratorThings();
-            } catch (IOException | SessionExpiredException e) {
-                logger.debug("Could refresh things", e);
-            }
-        }
+        // The bridge has no channels
     }
 
     @Override
@@ -133,62 +162,131 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
         logger.debug("childHandlerInitialized {}", childThing.getUID());
         String id = childThing.getConfiguration().as(GeneracMobileLinkGeneratorConfiguration.class).generatorId;
         Apparatus apparatus = apparatusesCache.get(id);
-        if (apparatus == null) {
-            logger.debug("No device for id {}", id);
+        HttpClient client = httpClient;
+        String accessToken = authSession.getCachedAccessToken();
+        if (apparatus == null || client == null || accessToken == null) {
+            // The next poll updates it
+            return;
+        }
+        scheduler.execute(() -> {
+            try {
+                updateGeneratorThing(client, accessToken, childHandler, apparatus);
+            } catch (IOException e) {
+                logger.debug("Could not initialize child", e);
+            }
+        });
+    }
+
+    private synchronized void startPoll(int refreshIntervalSeconds) {
+        stopPoll(true);
+        int generation = pollGeneration;
+        pollFuture = scheduler.scheduleWithFixedDelay(() -> poll(generation), 1, refreshIntervalSeconds,
+                TimeUnit.SECONDS);
+    }
+
+    private synchronized void stopPoll(boolean interrupt) {
+        pollGeneration++;
+        Future<?> pollFuture = this.pollFuture;
+        if (pollFuture != null) {
+            pollFuture.cancel(interrupt);
+            this.pollFuture = null;
+        }
+    }
+
+    /**
+     * Stops polling from within a poll, unless that poll has already been superseded.
+     */
+    private synchronized void stopPollFrom(int generation) {
+        if (generation == pollGeneration) {
+            stopPoll(false);
+        }
+    }
+
+    private void poll(int generation) {
+        HttpClient client = httpClient;
+        Auth0Client auth = auth0Client;
+        if (client == null || auth == null) {
             return;
         }
         try {
-            updateGeneratorThing(childHandler, apparatus);
-        } catch (IOException | SessionExpiredException e) {
-            logger.debug("Could not initialize child", e);
-        }
-    }
-
-    private synchronized void stopOrRestartPoll(boolean restart) {
-        Future<?> pollFuture = this.pollFuture;
-        if (pollFuture != null) {
-            pollFuture.cancel(true);
-            this.pollFuture = null;
-        }
-        if (restart) {
-            this.pollFuture = scheduler.scheduleWithFixedDelay(this::poll, 1, refreshIntervalSeconds, TimeUnit.SECONDS);
-        }
-    }
-
-    private void poll() {
-        try {
-            if (!loggedIn) {
-                login();
-            }
-            loggedIn = true;
-            updateGeneratorThings();
+            String accessToken = authSession.getAccessToken(auth,
+                    getConfigAs(GeneracMobileLinkAccountConfiguration.class));
+            updateGeneratorThings(client, accessToken, generation);
+            consecutivePollFailures = 0;
+        } catch (MfaCodeNeededException e) {
+            logger.debug("{}", e.getMessage());
+            String description = switch (e.getState()) {
+                case WAITING -> "mfa-" + e.getMfaType();
+                case REJECTED -> "mfa-code-rejected";
+                case EXPIRED -> "mfa-expired";
+            };
+            updateStatus(generation, ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_PENDING,
+                    "@text/thing.generacmobilelink.account.offline.configuration-pending." + description);
+        } catch (AuthException e) {
+            handleAuthFailure(e, generation);
         } catch (IOException e) {
-            logger.debug("Could not update devices", e);
-            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
-                    "@text/thing.generacmobilelink.account.offline.communication-error.io-exception");
-        } catch (SessionExpiredException e) {
-            logger.debug("Session expired", e);
-            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
-                    "@text/thing.generacmobilelink.account.offline.communication-error.session-expired");
-            loggedIn = false;
-        } catch (InvalidCredentialsException e) {
-            logger.debug("Credentials Invalid", e);
-            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
-                    "@text/thing.generacmobilelink.account.offline.configuration-error.invalid-credentials");
-            loggedIn = false;
-            // we don't want to continue polling with bad credentials
-            stopOrRestartPoll(false);
+            if (Thread.currentThread().isInterrupted()) {
+                // dispose() cancelled this poll
+                logger.debug("Poll interrupted", e);
+                return;
+            }
+            handlePollFailure(e, generation);
+        } catch (RuntimeException e) {
+            // Unexpected, but it must not end the schedule, which would freeze the bridge in its last status
+            logger.warn("Unexpected error while polling MobileLink", e);
+            handlePollFailure(new IOException(e), generation);
         }
     }
 
-    private void updateGeneratorThings() throws IOException, SessionExpiredException {
-        Apparatus[] apparatuses = getEndpoint(Apparatus[].class, "/v2/Apparatus/list");
+    private void updateStatus(int generation, ThingStatus status, ThingStatusDetail detail,
+            @Nullable String description) {
+        if (generation == pollGeneration) {
+            updateStatus(status, detail, description);
+        }
+    }
+
+    /**
+     * A refused login does not heal by itself, and repeating it can get the account locked, so polling stops until
+     * the configuration is saved again.
+     */
+    private void handleAuthFailure(AuthException e, int generation) {
+        logger.debug("Login failed: {}", e.getMessage());
+        String description = switch (e.getReason()) {
+            case INVALID_CREDENTIALS ->
+                "@text/thing.generacmobilelink.account.offline.configuration-error.invalid-credentials";
+            case MFA_UNSUPPORTED -> "@text/thing.generacmobilelink.account.offline.configuration-error.mfa-unsupported";
+            case INTERACTION_REQUIRED ->
+                "@text/thing.generacmobilelink.account.offline.configuration-error.interaction-required";
+            default -> "@text/thing.generacmobilelink.account.offline.configuration-error.login-rejected [\""
+                    + String.valueOf(e.getMessage()).replace('"', '\'') + "\"]";
+        };
+        updateStatus(generation, ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR, description);
+        stopPollFrom(generation);
+    }
+
+    /**
+     * Takes the bridge offline only after {@link #MAX_CONSECUTIVE_POLL_FAILURES} polls in a row have failed.
+     */
+    private void handlePollFailure(IOException e, int generation) {
+        consecutivePollFailures++;
+        if (consecutivePollFailures < MAX_CONSECUTIVE_POLL_FAILURES) {
+            logger.debug("Poll failed ({} of {} tolerated before going offline): {}", consecutivePollFailures,
+                    MAX_CONSECUTIVE_POLL_FAILURES, e.getMessage());
+            return;
+        }
+        logger.debug("Could not update devices", e);
+        updateStatus(generation, ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                "@text/thing.generacmobilelink.account.offline.communication-error.io-exception");
+    }
+
+    private void updateGeneratorThings(HttpClient client, String accessToken, int generation) throws IOException {
+        Apparatus[] apparatuses = getEndpoint(client, accessToken, Apparatus[].class, "/v5/Apparatus/list");
         if (apparatuses == null) {
             logger.debug("Could not decode apparatuses response");
             return;
         }
         if (getThing().getStatus() != ThingStatus.ONLINE) {
-            updateStatus(ThingStatus.ONLINE);
+            updateStatus(generation, ThingStatus.ONLINE, ThingStatusDetail.NONE, null);
         }
         for (Apparatus apparatus : apparatuses) {
             if (apparatus.type != 0) {
@@ -207,15 +305,16 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             } else {
                 ThingHandler handler = thing.get().getHandler();
                 if (handler != null) {
-                    updateGeneratorThing(handler, apparatus);
+                    updateGeneratorThing(client, accessToken, handler, apparatus);
                 }
             }
         }
     }
 
-    private void updateGeneratorThing(ThingHandler handler, Apparatus apparatus)
-            throws IOException, SessionExpiredException {
-        ApparatusDetail detail = getEndpoint(ApparatusDetail.class, "/v1/Apparatus/details/" + apparatus.apparatusId);
+    private void updateGeneratorThing(HttpClient client, String accessToken, ThingHandler handler, Apparatus apparatus)
+            throws IOException {
+        ApparatusDetail detail = getEndpoint(client, accessToken, ApparatusDetail.class,
+                "/v5/Apparatus/details/" + apparatus.apparatusId);
         if (detail != null) {
             ((GeneracMobileLinkGeneratorHandler) handler).updateGeneratorStatus(apparatus, detail);
         } else {
@@ -223,175 +322,33 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
         }
     }
 
-    private @Nullable <T> T getEndpoint(Class<T> clazz, String endpoint) throws IOException, SessionExpiredException {
+    private @Nullable <T> T getEndpoint(HttpClient client, String accessToken, Class<T> clazz, String endpoint)
+            throws IOException {
         try {
-            ContentResponse response = httpClient.newRequest(API_BASE + endpoint).send();
-            if (response.getStatus() == 204) {
+            ContentResponse response = client.newRequest(API_BASE + endpoint)
+                    .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                    .header(HttpHeader.AUTHORIZATION, "Bearer " + accessToken)
+                    .header(HttpHeader.ACCEPT, "application/json").agent(Auth0Client.USER_AGENT_APP).send();
+            int status = response.getStatus();
+            if (status == 204) {
                 // no data
                 return null;
             }
-            if (response.getStatus() != 200) {
-                throw new SessionExpiredException("API returned status code: " + response.getStatus());
+            if (status == 401) {
+                // The next poll refreshes the token
+                authSession.invalidateAccessToken();
+            }
+            if (status != 200) {
+                throw new IOException("API returned status code: " + status);
             }
             String data = response.getContentAsString();
-            logger.debug("getEndpoint {}", data);
+            logger.trace("getEndpoint {}", data);
             return GSON.fromJson(data, clazz);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException(e);
         } catch (TimeoutException | ExecutionException | JsonSyntaxException e) {
             throw new IOException(e);
-        }
-    }
-
-    /**
-     * Attempts to login through a Microsoft Azure implicit grant oauth flow
-     *
-     * @throws IOException if there is a problem communicating or parsing the responses
-     * @throws InvalidCredentialsException If Azure rejects the login credentials.
-     */
-    private synchronized void login() throws IOException, InvalidCredentialsException {
-        logger.debug("Attempting login");
-        GeneracMobileLinkAccountConfiguration config = getConfigAs(GeneracMobileLinkAccountConfiguration.class);
-        refreshIntervalSeconds = config.refreshInterval;
-        try {
-            ContentResponse signInResponse = httpClient.newRequest(API_BASE + "/Auth/SignIn?email=" + config.username)
-                    .send();
-
-            String responseData = signInResponse.getContentAsString();
-            logger.trace("response data: {}", responseData);
-
-            // If we are immediately returned a submit form, it means our cookies are still valid with the identity
-            // provider and we can just try and submit to the API service
-            if (submitPage(responseData)) {
-                return;
-            }
-
-            // Azure wants us to login again, look for the SETTINGS javascript in the page
-            Matcher matcher = SETTINGS_PATTERN.matcher(responseData);
-            if (!matcher.find()) {
-                throw new IOException("Could not find settings string");
-            }
-
-            String parseSettings = matcher.group(1);
-            logger.debug("parseSettings: {}", parseSettings);
-            SignInConfig signInConfig = GSON.fromJson(parseSettings, SignInConfig.class);
-
-            if (signInConfig == null) {
-                throw new IOException("Could not parse settings string");
-            }
-
-            Fields fields = new Fields();
-            fields.put("request_type", "RESPONSE");
-            fields.put("signInName", config.username);
-            fields.put("password", config.password);
-
-            Request selfAssertedRequest = httpClient.POST(LOGIN_BASE + "/SelfAsserted")
-                    .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS).header("X-Csrf-Token", signInConfig.csrf)
-                    .param("tx", "StateProperties=" + signInConfig.transId).param("p", "B2C_1A_SignUpOrSigninOnline")
-                    .content(new FormContentProvider(fields));
-
-            ContentResponse selfAssertedResponse = selfAssertedRequest.send();
-
-            logger.debug("selfAssertedRequest response {}", selfAssertedResponse.getStatus());
-
-            if (selfAssertedResponse.getStatus() != 200) {
-                throw new IOException("SelfAsserted: Bad response status: " + selfAssertedResponse.getStatus());
-            }
-
-            SelfAssertedResponse sa = GSON.fromJson(selfAssertedResponse.getContentAsString(),
-                    SelfAssertedResponse.class);
-
-            if (sa == null) {
-                throw new IOException("SelfAsserted Could not parse response JSON");
-            }
-
-            if (!"200".equals(sa.status)) {
-                throw new InvalidCredentialsException("Invalid Credentials: " + sa.message);
-            }
-
-            Request confirmedRequest = httpClient.newRequest(LOGIN_BASE + "/api/CombinedSigninAndSignup/confirmed")
-                    .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS).param("csrf_token", signInConfig.csrf)
-                    .param("tx", "StateProperties=" + signInConfig.transId).param("p", "B2C_1A_SignUpOrSigninOnline");
-
-            ContentResponse confirmedResponse = confirmedRequest.send();
-
-            if (confirmedResponse.getStatus() != 200) {
-                throw new IOException("CombinedSigninAndSignup bad response: " + confirmedResponse.getStatus());
-            }
-
-            String loginString = confirmedResponse.getContentAsString();
-            logger.trace("confirmedResponse: {}", loginString);
-            if (!submitPage(loginString)) {
-                throw new IOException("Error parsing HTML submit form");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException(e);
-        } catch (ExecutionException | TimeoutException | JsonSyntaxException e) {
-            throw new IOException(e);
-        }
-    }
-
-    /**
-     * Attempts to submit a HTML form from Azure to the Generac API, returns false if the HTML does not match the
-     * required form
-     *
-     * @param loginString
-     * @return false if the HTML is not a form, true if submission is successful
-     * @throws ExecutionException
-     * @throws TimeoutException
-     * @throws InterruptedException
-     * @throws JsonSyntaxException
-     * @throws IOException
-     */
-    private boolean submitPage(String loginString)
-            throws ExecutionException, TimeoutException, InterruptedException, JsonSyntaxException, IOException {
-        Document loginPage = Jsoup.parse(loginString);
-        Element form = loginPage.select("form").first();
-        Element loginState = loginPage.select("input[name=state]").first();
-        Element loginCode = loginPage.select("input[name=code]").first();
-
-        if (form == null || loginState == null || loginCode == null) {
-            logger.debug("Could not load login page");
-            return false;
-        }
-
-        // url that the form will submit to
-        String action = form.attr("action");
-
-        Fields fields = new Fields();
-        fields.put("state", loginState.attr("value"));
-        fields.put("code", loginCode.attr("value"));
-
-        Request loginRequest = httpClient.POST(action).timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                .content(new FormContentProvider(fields));
-
-        ContentResponse loginResponse = loginRequest.send();
-        if (logger.isTraceEnabled()) {
-            logger.trace("login response {} {}", loginResponse.getStatus(), loginResponse.getContentAsString());
-        } else {
-            logger.debug("login response status {}", loginResponse.getStatus());
-        }
-        if (loginResponse.getStatus() != 200) {
-            throw new IOException("Bad api login resposne: " + loginResponse.getStatus());
-        }
-        return true;
-    }
-
-    private class InvalidCredentialsException extends Exception {
-        private static final long serialVersionUID = 1L;
-
-        public InvalidCredentialsException(String message) {
-            super(message);
-        }
-    }
-
-    private class SessionExpiredException extends Exception {
-        private static final long serialVersionUID = 1L;
-
-        public SessionExpiredException(String message) {
-            super(message);
         }
     }
 }
