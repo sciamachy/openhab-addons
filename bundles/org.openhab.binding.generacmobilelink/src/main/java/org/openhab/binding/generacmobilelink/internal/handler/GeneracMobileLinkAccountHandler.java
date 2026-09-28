@@ -19,8 +19,10 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
@@ -79,6 +81,9 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private final HttpClientFactory httpClientFactory;
     private final GeneracMobileLinkDiscoveryService discoveryService;
     private final AuthSession authSession;
+    private final Function<HttpClient, Auth0Client> auth0ClientFactory;
+    private final String apiBase;
+    private final @Nullable ScheduledExecutorService executor;
     private final Map<String, Apparatus> apparatusesCache = new ConcurrentHashMap<>();
     private volatile @Nullable HttpClient httpClient;
     private volatile @Nullable Auth0Client auth0Client;
@@ -93,12 +98,30 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
 
     public GeneracMobileLinkAccountHandler(Bridge bridge, HttpClientFactory httpClientFactory,
             GeneracMobileLinkDiscoveryService discoveryService, StorageService storageService) {
+        this(bridge, httpClientFactory, discoveryService, new AuthSession(storageService.getStorage(
+                GeneracMobileLinkBindingConstants.BINDING_ID + "." + bridge.getUID().getAsString().replace(':', '_'),
+                String.class.getClassLoader())), Auth0Client::new, API_BASE, null);
+    }
+
+    /**
+     * For tests: replaces the login, the API location and, if given, the executor used for polling.
+     */
+    GeneracMobileLinkAccountHandler(Bridge bridge, HttpClientFactory httpClientFactory,
+            GeneracMobileLinkDiscoveryService discoveryService, AuthSession authSession,
+            Function<HttpClient, Auth0Client> auth0ClientFactory, String apiBase,
+            @Nullable ScheduledExecutorService executor) {
         super(bridge);
         this.httpClientFactory = httpClientFactory;
         this.discoveryService = discoveryService;
-        this.authSession = new AuthSession(storageService.getStorage(
-                GeneracMobileLinkBindingConstants.BINDING_ID + "." + bridge.getUID().getAsString().replace(':', '_'),
-                String.class.getClassLoader()));
+        this.authSession = authSession;
+        this.auth0ClientFactory = auth0ClientFactory;
+        this.apiBase = apiBase;
+        this.executor = executor;
+    }
+
+    private ScheduledExecutorService executor() {
+        ScheduledExecutorService executor = this.executor;
+        return executor != null ? executor : scheduler;
     }
 
     @Override
@@ -124,7 +147,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             return;
         }
         httpClient = client;
-        auth0Client = new Auth0Client(client);
+        auth0Client = auth0ClientFactory.apply(client);
         consecutivePollFailures = 0;
         authSession.configurationApplied();
         updateStatus(ThingStatus.UNKNOWN);
@@ -168,7 +191,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             // The next poll updates it
             return;
         }
-        scheduler.execute(() -> {
+        executor().execute(() -> {
             try {
                 updateGeneratorThing(client, accessToken, childHandler, apparatus);
             } catch (IOException e) {
@@ -180,7 +203,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private synchronized void startPoll(int refreshIntervalSeconds) {
         stopPoll(true);
         int generation = pollGeneration;
-        pollFuture = scheduler.scheduleWithFixedDelay(() -> poll(generation), 1, refreshIntervalSeconds,
+        pollFuture = executor().scheduleWithFixedDelay(() -> poll(generation), 1, refreshIntervalSeconds,
                 TimeUnit.SECONDS);
     }
 
@@ -325,7 +348,7 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
     private @Nullable <T> T getEndpoint(HttpClient client, String accessToken, Class<T> clazz, String endpoint)
             throws IOException {
         try {
-            ContentResponse response = client.newRequest(API_BASE + endpoint)
+            ContentResponse response = client.newRequest(apiBase + endpoint)
                     .timeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                     .header(HttpHeader.AUTHORIZATION, "Bearer " + accessToken)
                     .header(HttpHeader.ACCEPT, "application/json").agent(Auth0Client.USER_AGENT_APP).send();
