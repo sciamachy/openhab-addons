@@ -18,11 +18,8 @@ import static org.mockito.Mockito.*;
 import static org.openhab.binding.generacmobilelink.internal.handler.AuthSession.*;
 
 import java.io.IOException;
-import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,7 +44,7 @@ public class AuthSessionTest {
     private static final Instant START = Instant.parse("2026-09-27T12:00:00Z");
     private static final DPoPKey KEY = DPoPKey.generate();
 
-    private final MutableClock clock = new MutableClock();
+    private final MutableClock clock = new MutableClock(START);
     private VolatileStorage<String> storage = new VolatileStorage<>();
     private AuthSession session = new AuthSession(storage, clock);
     private Auth0Client client = mock(Auth0Client.class);
@@ -345,28 +342,5 @@ public class AuthSessionTest {
         assertEquals("access-1", session.getCachedAccessToken());
         clock.advance(Duration.ofHours(2));
         assertNull(session.getCachedAccessToken());
-    }
-
-    private static class MutableClock extends Clock {
-        private Instant now = START;
-
-        void advance(Duration duration) {
-            now = now.plus(duration);
-        }
-
-        @Override
-        public ZoneId getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(@NonNullByDefault({}) ZoneId zone) {
-            return this;
-        }
-
-        @Override
-        public Instant instant() {
-            return now;
-        }
     }
 }
