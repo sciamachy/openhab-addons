@@ -75,6 +75,8 @@ class AuthSession {
     private Duration loginBackoff = Duration.ZERO;
     private Instant nextLoginAllowed = Instant.MIN;
     private volatile boolean configurationApplied = true;
+    /** Set when the bridge is removed, so that a login still in progress does not persist tokens again. */
+    private volatile boolean closed;
 
     AuthSession(Storage<String> storage) {
         this(storage, Clock.systemUTC());
@@ -149,10 +151,11 @@ class AuthSession {
     }
 
     /**
-     * Forgets everything, including the persisted tokens. Does not wait for a login in progress, since the caller
-     * (thing removal) runs after dispose() has interrupted it.
+     * Forgets everything, including the persisted tokens, for good. Does not wait for a login in progress: thing
+     * removal calls this before dispose(), so a poll may still be running; it no longer persists anything.
      */
     void reset() {
+        closed = true;
         clearTokens();
         pendingLogin = null;
         storage.remove(KEY_USED_MFA_CODE);
@@ -179,6 +182,10 @@ class AuthSession {
         if (pending == null) {
             if (!configurationApplied && clock.instant().isBefore(nextLoginAllowed)) {
                 throw new IOException("Last login failed, next attempt after " + nextLoginAllowed);
+            }
+            if (configurationApplied) {
+                // The user saved the configuration: forget earlier failures entirely, not just for this attempt
+                loginBackoff = Duration.ZERO;
             }
             configurationApplied = false;
             try {
@@ -207,6 +214,10 @@ class AuthSession {
     }
 
     private void loginFailed() {
+        if (Thread.currentThread().isInterrupted()) {
+            // dispose() cancelled the login; that says nothing about MobileLink
+            return;
+        }
         loginBackoff = loginBackoff.isZero() ? MIN_LOGIN_BACKOFF
                 : loginBackoff.multipliedBy(2).compareTo(MAX_LOGIN_BACKOFF) > 0 ? MAX_LOGIN_BACKOFF
                         : loginBackoff.multipliedBy(2);
@@ -215,7 +226,9 @@ class AuthSession {
 
     private TokenSet submitMfaCode(Auth0Client client, PendingLogin pending, String code)
             throws IOException, AuthException, MfaCodeNeededException {
-        storage.put(KEY_USED_MFA_CODE, fingerprint(code));
+        if (!closed) {
+            storage.put(KEY_USED_MFA_CODE, fingerprint(code));
+        }
         try {
             TokenSet result = client.submitMfaCode(pending, code);
             pendingLogin = null;
@@ -271,6 +284,9 @@ class AuthSession {
     }
 
     private void saveTokens(String username, TokenSet newTokens) {
+        if (closed) {
+            return;
+        }
         tokens = newTokens;
         tokensUsername = username;
         storage.put(KEY_USERNAME, username);

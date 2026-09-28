@@ -27,12 +27,14 @@ import java.util.function.Function;
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.client.WWWAuthenticationProtocolHandler;
 import org.eclipse.jetty.client.api.ContentResponse;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.util.HttpCookieStore;
 import org.openhab.binding.generacmobilelink.internal.GeneracMobileLinkBindingConstants;
 import org.openhab.binding.generacmobilelink.internal.api.Auth0Client;
 import org.openhab.binding.generacmobilelink.internal.api.AuthException;
+import org.openhab.binding.generacmobilelink.internal.api.OAuthErrorException;
 import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkAccountConfiguration;
 import org.openhab.binding.generacmobilelink.internal.config.GeneracMobileLinkGeneratorConfiguration;
 import org.openhab.binding.generacmobilelink.internal.discovery.GeneracMobileLinkDiscoveryService;
@@ -45,6 +47,7 @@ import org.openhab.core.thing.ChannelUID;
 import org.openhab.core.thing.Thing;
 import org.openhab.core.thing.ThingStatus;
 import org.openhab.core.thing.ThingStatusDetail;
+import org.openhab.core.thing.ThingStatusInfo;
 import org.openhab.core.thing.binding.BaseBridgeHandler;
 import org.openhab.core.thing.binding.ThingHandler;
 import org.openhab.core.types.Command;
@@ -146,6 +149,9 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
                     "@text/thing.generacmobilelink.account.offline.communication-error.http-client");
             return;
         }
+        // Jetty turns a 401 without a WWW-Authenticate header into an exception, which would hide that the API
+        // rejected the access token; the binding handles 401 itself. start() installs the handler, so remove it after.
+        client.getProtocolHandlers().remove(WWWAuthenticationProtocolHandler.NAME);
         httpClient = client;
         auth0Client = auth0ClientFactory.apply(client);
         consecutivePollFailures = 0;
@@ -171,8 +177,23 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
 
     @Override
     public void handleRemoval() {
+        // openHAB calls this before dispose(), so stop a poll that may be logging in before deleting the tokens
+        stopPoll(true);
         authSession.reset();
         super.handleRemoval();
+    }
+
+    /**
+     * While the bridge waits for the user (a refused login, a code that was not entered in time), saving the
+     * configuration unchanged has to retry, as the status text says. openHAB would otherwise ignore such a save.
+     */
+    @Override
+    protected boolean isModifyingCurrentConfig(Map<String, Object> configurationParameters) {
+        ThingStatusInfo status = getThing().getStatusInfo();
+        boolean waitingForUser = status.getStatus() == ThingStatus.OFFLINE
+                && (status.getStatusDetail() == ThingStatusDetail.CONFIGURATION_ERROR
+                        || status.getStatusDetail() == ThingStatusDetail.CONFIGURATION_PENDING);
+        return waitingForUser || super.isModifyingCurrentConfig(configurationParameters);
     }
 
     @Override
@@ -298,8 +319,17 @@ public class GeneracMobileLinkAccountHandler extends BaseBridgeHandler {
             return;
         }
         logger.debug("Could not update devices", e);
-        updateStatus(generation, ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
-                "@text/thing.generacmobilelink.account.offline.communication-error.io-exception");
+        String description = "@text/thing.generacmobilelink.account.offline.communication-error.io-exception";
+        if (e instanceof OAuthErrorException oauthError) {
+            // Unlike a network error this may not heal by itself (a wrong system clock, a client Generac
+            // retired), so say what Auth0 answered
+            if (consecutivePollFailures == MAX_CONSECUTIVE_POLL_FAILURES) {
+                logger.warn("MobileLink login keeps failing: {}", e.getMessage());
+            }
+            description = "@text/thing.generacmobilelink.account.offline.communication-error.oauth-error [\""
+                    + oauthError.getError().replace('"', '\'') + "\"]";
+        }
+        updateStatus(generation, ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, description);
     }
 
     private void updateGeneratorThings(HttpClient client, String accessToken, int generation) throws IOException {
