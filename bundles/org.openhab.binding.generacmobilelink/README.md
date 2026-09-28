@@ -33,10 +33,12 @@ The MobileLink account bridge must be added manually. Once added, generator thin
 
 The binding logs in the same way as the MobileLink mobile app.
 After the first login it keeps a refresh token in openHAB's storage and does not need to log in again, even after a restart, until MobileLink invalidates that token.
+The refresh token and the private key it is bound to are stored unencrypted in `userdata/jsondb`, like other openHAB credentials; protect that directory and its backups accordingly.
 Changing the username discards the stored token; deleting the bridge in the UI deletes it.
 
 If MobileLink refuses the login, for example because of a wrong password, the bridge goes `OFFLINE (CONFIGURATION_ERROR)` and stops trying, so that repeated attempts cannot get the account locked.
-Correct the configuration and save it to try again.
+Correct the configuration and save it to try again; in the UI, saving without changes also retries.
+With a `.things` file, change a value (for example clear `mfaCode`) or disable and re-enable the bridge, since an unchanged file is not reloaded.
 Communication errors take the bridge offline after three failed polls in a row; it keeps trying, and logins that fail this way are spaced out from five minutes up to one hour.
 
 Generac states that it restricts third-party access to MobileLink.
@@ -52,17 +54,19 @@ If your MobileLink account uses multi-factor authentication, the bridge goes `OF
   Enter it as `mfaCode` and save within ten minutes.
 
 If no code is entered within ten minutes, the bridge stops the login and says so; it does not start a new one (and send a new SMS or email) by itself.
-Save the configuration to start a new login.
+Save the configuration to start a new login (see above for `.things` files).
 
 A code is only asked for when the binding has to log in again, not on every restart.
 Each code is used only once, so leaving an old code in the configuration is harmless: the bridge asks for a new one when it needs it.
-Push notifications and security keys cannot be used; switch the account to one of the factors above to use it with openHAB.
+Push notifications, passkeys and security keys cannot be used; switch the account to one of the factors above to use it with openHAB.
 
 ### Upgrading from Earlier Versions
 
 MobileLink replaced its previous login page, which earlier versions of this binding used, so those versions can no longer log in.
 The configuration parameters are unchanged: the existing `username` and `password` keep working.
 Accounts with multi-factor authentication need one code on the first start, as described above.
+The default refresh interval changed from 60 to 300 seconds.
+Bridges without a configured value now poll every five minutes; bridges created in the UI usually stored 60 and keep it, so consider raising it.
 
 ### Generator
 

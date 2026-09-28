@@ -138,9 +138,11 @@ public class Auth0Client {
         Fields identifier = new Fields();
         identifier.put("username", email);
         identifier.put("js-available", "true");
-        identifier.put("webauthn-available", "true");
+        // Deny WebAuthn, as at the capability check below: a headless client cannot use passkeys or security keys,
+        // and saying so keeps Auth0 from offering them
+        identifier.put("webauthn-available", "false");
         identifier.put("is-brave", "false");
-        identifier.put("webauthn-platform-available", "true");
+        identifier.put("webauthn-platform-available", "false");
         next = postForm(cookies, URI.create(authBase + "/u/login/identifier"), requireState(next), identifier,
                 "identifier");
         if (!path(next).endsWith("/u/login/password")) {
@@ -238,6 +240,8 @@ public class Auth0Client {
             } else if (path.contains("/u/mfa-")) {
                 throw new AuthException(Reason.MFA_UNSUPPORTED,
                         "Unsupported second factor " + path.replaceFirst(".*/u/", ""));
+            } else if (path.contains("/u/passkey")) {
+                throw new AuthException(Reason.INTERACTION_REQUIRED, "Auth0 asks for a passkey");
             } else if (path.contains("/u/custom-prompt/")) {
                 // Pages such as updated terms, which Auth0 shows once per account. Accept with the default action,
                 // as the app's primary button would.
@@ -327,6 +331,9 @@ public class Auth0Client {
             // page included, must not cost the refresh token.
             if ("invalid_grant".equals(error)) {
                 throw new AuthException(Reason.INVALID_GRANT, description);
+            }
+            if (error != null) {
+                throw new OAuthErrorException(error, description);
             }
             throw new IOException(description);
         }

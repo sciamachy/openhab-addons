@@ -44,6 +44,7 @@ import org.openhab.binding.generacmobilelink.internal.api.AuthException;
 import org.openhab.binding.generacmobilelink.internal.api.AuthException.Reason;
 import org.openhab.binding.generacmobilelink.internal.api.DPoPKey;
 import org.openhab.binding.generacmobilelink.internal.api.MfaRequiredException;
+import org.openhab.binding.generacmobilelink.internal.api.OAuthErrorException;
 import org.openhab.binding.generacmobilelink.internal.api.PendingLogin;
 import org.openhab.binding.generacmobilelink.internal.api.TokenSet;
 import org.openhab.binding.generacmobilelink.internal.discovery.GeneracMobileLinkDiscoveryService;
@@ -261,6 +262,57 @@ public class GeneracMobileLinkAccountHandlerTest {
         verify(futures.get(0), never()).cancel(anyBoolean());
     }
 
+    @Test
+    public void rejectedAccessTokenIsRefreshedOnTheNextPoll() throws Exception {
+        when(auth0.login(any(), any())).thenReturn(tokens());
+        when(auth0.refresh("refresh-1", KEY))
+                .thenReturn(new TokenSet("access-2", clock.instant().plus(Duration.ofHours(2)), "refresh-1", KEY));
+        start(bridge(""));
+        poll();
+
+        apiStatus = 401;
+        poll();
+        verify(auth0, never()).refresh(any(), any());
+
+        apiStatus = 200;
+        poll();
+        verify(auth0).refresh("refresh-1", KEY);
+        assertEquals("Bearer access-2", apiAuthorizations.get(apiAuthorizations.size() - 1));
+    }
+
+    @Test
+    public void reinitializingStartsTheFailureCountAfresh() throws Exception {
+        when(auth0.login(any(), any())).thenReturn(tokens());
+        GeneracMobileLinkAccountHandler handler = start(bridge(""));
+        poll();
+        apiStatus = 500;
+        poll();
+        poll();
+
+        handler.thingUpdated(bridge(""));
+        poll();
+
+        assertEquals(0, offlineCount());
+    }
+
+    @Test
+    public void oauthErrorsNameTheErrorCode() throws Exception {
+        when(auth0.login(any(), any())).thenReturn(tokens());
+        when(auth0.refresh(any(), any())).thenThrow(new OAuthErrorException("invalid_dpop_proof", "refresh failed"));
+        start(bridge(""));
+        poll();
+        clock.advance(Duration.ofHours(2));
+
+        poll();
+        poll();
+        assertEquals(0, offlineCount());
+        poll();
+
+        assertStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                TEXT + "communication-error.oauth-error [\"invalid_dpop_proof\"]");
+        verify(futures.get(0), never()).cancel(anyBoolean());
+    }
+
     // ---- status texts ----------------------------------------------------------------------------------------------
 
     @ParameterizedTest
@@ -354,6 +406,55 @@ public class GeneracMobileLinkAccountHandlerTest {
         poll();
         verify(auth0, times(3)).login(any(), any());
         assertStatus(ThingStatus.ONLINE, ThingStatusDetail.NONE, null);
+    }
+
+    @Test
+    public void unchangedSaveRetriesWhileTheBridgeWaitsForTheUser() throws Exception {
+        MfaRequiredException first = new MfaRequiredException(pending("sms"));
+        MfaRequiredException second = new MfaRequiredException(pending("sms"));
+        when(auth0.login(any(), any())).thenThrow(first, second);
+        GeneracMobileLinkAccountHandler handler = start(bridge(""));
+        poll();
+        clock.advance(AuthSession.PENDING_LOGIN_LIFETIME.plusSeconds(1));
+        poll();
+        assertStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_PENDING,
+                TEXT + "configuration-pending.mfa-expired");
+
+        // MainUI's Save without changes
+        handler.handleConfigurationUpdate(Map.of("mfaCode", ""));
+        poll();
+
+        verify(auth0, times(2)).login(any(), any());
+        assertStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_PENDING,
+                TEXT + "configuration-pending.mfa-sms");
+    }
+
+    @Test
+    public void unchangedSaveOfAWorkingBridgeDoesNothing() throws Exception {
+        when(auth0.login(any(), any())).thenReturn(tokens());
+        GeneracMobileLinkAccountHandler handler = start(bridge(""));
+        poll();
+
+        handler.handleConfigurationUpdate(Map.of("mfaCode", ""));
+
+        assertEquals(1, polls.size());
+        verify(futures.get(0), never()).cancel(anyBoolean());
+    }
+
+    @Test
+    public void removalStopsPollingBeforeDeletingTheTokens() throws Exception {
+        VolatileStorage<String> storage = new VolatileStorage<>();
+        session = new AuthSession(storage, clock);
+        when(auth0.login(any(), any())).thenReturn(tokens());
+        GeneracMobileLinkAccountHandler handler = start(bridge(""));
+        poll();
+        assertNotNull(storage.get(AuthSession.KEY_REFRESH_TOKEN));
+
+        handler.handleRemoval();
+
+        verify(futures.get(0)).cancel(true);
+        assertNull(storage.get(AuthSession.KEY_REFRESH_TOKEN));
+        assertNull(storage.get(AuthSession.KEY_DPOP_KEY));
     }
 
     // ---- generation guard and lifecycle ----------------------------------------------------------------------------

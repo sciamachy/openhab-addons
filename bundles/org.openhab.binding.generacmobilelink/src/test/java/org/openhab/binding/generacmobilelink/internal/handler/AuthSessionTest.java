@@ -283,6 +283,56 @@ public class AuthSessionTest {
     }
 
     @Test
+    public void configurationSaveResetsTheBackoffEntirely() throws Exception {
+        when(client.login(any(), any())).thenThrow(new IOException("down"));
+        for (int i = 0; i < 4; i++) {
+            assertThrows(IOException.class, () -> session.getAccessToken(client, config));
+            clock.advance(MAX_LOGIN_BACKOFF);
+        }
+        verify(client, times(4)).login(any(), any());
+
+        session.configurationApplied();
+        assertThrows(IOException.class, () -> session.getAccessToken(client, config));
+        verify(client, times(5)).login(any(), any());
+
+        // Back to the first step, not to where the backoff had got to
+        clock.advance(MIN_LOGIN_BACKOFF);
+        assertThrows(IOException.class, () -> session.getAccessToken(client, config));
+        verify(client, times(6)).login(any(), any());
+    }
+
+    @Test
+    public void interruptedLoginIsNotAFailure() throws Exception {
+        when(client.login(any(), any())).thenAnswer(invocation -> {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted");
+        });
+        try {
+            assertThrows(IOException.class, () -> session.getAccessToken(client, config));
+        } finally {
+            Thread.interrupted();
+        }
+
+        assertThrows(IOException.class, () -> session.getAccessToken(client, config));
+        verify(client, times(2)).login(any(), any());
+    }
+
+    @Test
+    public void loginFinishingAfterRemovalPersistsNothing() throws Exception {
+        when(client.login(any(), any())).thenAnswer(invocation -> {
+            // The bridge is removed while the login is on the wire
+            session.reset();
+            return tokens("access-1");
+        });
+
+        session.getAccessToken(client, config);
+
+        assertNull(storage.get(KEY_REFRESH_TOKEN));
+        assertNull(storage.get(KEY_DPOP_KEY));
+        assertNull(storage.get(KEY_USERNAME));
+    }
+
+    @Test
     public void communicationErrorAfterTheCodeDropsTheSpentLogin() throws Exception {
         PendingLogin first = pending("otp");
         PendingLogin second = pending("otp");

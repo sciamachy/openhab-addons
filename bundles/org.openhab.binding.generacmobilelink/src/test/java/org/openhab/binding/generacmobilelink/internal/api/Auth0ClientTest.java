@@ -183,6 +183,19 @@ public class Auth0ClientTest {
     }
 
     @Test
+    public void passkeyPromptNeedsAPerson() {
+        auth0.passkeyPrompt = true;
+        AuthException e = assertThrows(AuthException.class, () -> client().login(EMAIL, PASSWORD));
+        assertEquals(Reason.INTERACTION_REQUIRED, e.getReason());
+    }
+
+    @Test
+    public void identifierStepDeniesWebAuthn() throws Exception {
+        client().login(EMAIL, PASSWORD);
+        assertEquals("false", auth0.identifierWebauthn);
+    }
+
+    @Test
     public void absoluteRedirectsAreFollowed() throws Exception {
         auth0.absoluteRedirects = true;
         assertEquals("access-1", client().login(EMAIL, PASSWORD).accessToken());
@@ -270,7 +283,9 @@ public class Auth0ClientTest {
         // Only invalid_grant means the refresh token is gone; anything else must not force a new login
         auth0.refreshStatus = 403;
         auth0.refreshError = "access_denied";
-        assertThrows(IOException.class, () -> client().refresh("refresh-1", DPoPKey.generate()));
+        OAuthErrorException e = assertThrows(OAuthErrorException.class,
+                () -> client().refresh("refresh-1", DPoPKey.generate()));
+        assertEquals("access_denied", e.getError());
         auth0.refreshStatus = 400;
         auth0.refreshError = "invalid_request";
         assertThrows(IOException.class, () -> client().refresh("refresh-1", DPoPKey.generate()));
@@ -299,6 +314,9 @@ public class Auth0ClientTest {
         String callbackError;
         int authorizeStatus = 302;
         String refreshError = "invalid_grant";
+        boolean passkeyPrompt;
+        @Nullable
+        String identifierWebauthn;
         @Nullable
         String mfaType;
         boolean customPrompt;
@@ -341,6 +359,7 @@ public class Auth0ClientTest {
                     redirect(exchange, "/u/login/identifier?state=s-identifier");
                 } else if ("/u/login/identifier".equals(path)) {
                     Map<String, String> form = form(exchange, "s-identifier");
+                    identifierWebauthn = form.get("webauthn-available");
                     redirect(exchange, EMAIL.equals(form.get("username")) ? "/u/login/password?state=s-password"
                             : "/u/login/identifier?state=s-identifier");
                 } else if ("/u/login/password".equals(path)) {
@@ -356,6 +375,8 @@ public class Auth0ClientTest {
                     String error = callbackError;
                     if (error != null) {
                         redirect(exchange, Auth0Client.REDIRECT_URI + "?error=" + error + "&state=" + oauthState);
+                    } else if (passkeyPrompt) {
+                        redirect(exchange, "/u/passkey-enrollment?state=s-passkey");
                     } else if (detectCapabilities && !capabilitiesDetected) {
                         redirect(exchange, "/u/mfa-detect-browser-capabilities?state=s-detect");
                     } else if (mfaType != null && !mfaPassed) {
